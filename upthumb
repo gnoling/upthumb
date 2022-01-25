@@ -1,0 +1,508 @@
+#!/usr/bin/env perl
+# UpThumb
+use strict;
+use warnings;
+use Log::Log4perl qw/:easy/;
+use Getopt::Long  qw/:config pass_through/;
+use File::Copy;
+use Array::Columnize;
+use v5.10;
+
+my %opt = (
+  tmpdir    => '/dev/shm/upthumb'.$$,
+  frameres  => undef,
+  range     => undef,
+  thumbres  => '640:-1',
+  ffmpeg    => '/home/garret/bin/ffmpeg',
+  convert   => '/usr/bin/convert',
+  identify  => '/usr/bin/identify',
+  deepfry   => 0,
+  verbose   => 0,
+  thumb     => undef,
+  forks     => 16,
+  keepfresh => 1,
+  fps       => 4,
+  full      => 0,
+  vmaf      => 0,
+  psnr      => 1,
+  ssim      => 0,
+  ms_ssim   => 0,
+  clean     => 1,
+  limit     => 3000,
+  deint     => 0,
+  tryharder => 0,
+  hwaccel   => 'vdpau',
+  loglevel  => 'INFO',
+  replaceat => 20,
+  magic     => 1,
+);
+
+GetOptions(
+  \%opt,
+  'deepfry!',
+  'tmpdir|t=s',
+  'frameres|fr=s',
+  'range|r=s',
+  'thumbres|tr=s',
+  'ffmpeg|f=s',
+  'verbose|v!',
+  'forks=i',
+  'fps=i',
+  'full!',
+  'vmaf!',
+  'psnr!',
+  'ssim!',
+  'ms_ssim!',
+  'convert=s',
+  'clean!',
+  'frame=i',
+  'keepfresh!',
+  'limit=i',
+  'deint!',
+  'tryharder!',
+  'deep!',
+  'hwaccel=s',
+  'loglevel|ll=s',
+  'replaceat=i',
+  'magic!',
+);
+
+if($opt{tryharder}) {
+  $opt{limit} = 5000;
+}
+if($opt{deep}) {
+  $opt{full}  = 1;
+  $opt{limit} = 0;
+}
+
+my $LOGLEVEL = uc($opt{loglevel});
+my $logger   = qq(
+  log4perl.logger                    = $LOGLEVEL, STDINF
+  log4perl.appender.STDINF           = Log::Log4perl::Appender::ScreenColoredLevels
+  log4perl.appender.STDINF.stderr    = 0
+  log4perl.appender.STDINF.utf8      = 1
+  log4perl.appender.STDINF.layout    = PatternLayout
+  log4perl.appender.STDINF.layout.ConversionPattern = %d %m{chomp}%n
+);
+Log::Log4perl->init_once(\$logger);
+
+push @ARGV, '.' if scalar(@ARGV)==0;
+
+my @queue;
+while(my $item = shift @ARGV) {
+  if(-f $item) {
+    (my $thumb = $item) =~ s/(.*)\.[^\.]+/$1/;
+    if(-f "$thumb-thumb.jpg.up" && -f "$thumb-thumb.jpg.orig") {
+      unlink("$thumb-thumb.jpg.up");
+      move("$thumb-thumb.jpg.orig", "$thumb-thumb.jpg.up");
+    }
+    if(-f "$thumb-thumb.jpg.up" && !-f "$thumb-thumb.jpg") {
+      move("$thumb-thumb.jpg.up", "$thumb-thumb.jpg");
+    }
+    if(-f "$thumb.tbn.up" && !-f "$thumb.tbn") {
+      move("$thumb.tbn.up", "$thumb.tbn");
+    }
+    my $source_thumb = (-f "$thumb.tbn") ? "$thumb.tbn" : "$thumb-thumb.jpg";
+    my $dest_thumb   = "$thumb-thumb.jpg";
+    push @queue, {
+      file  => $item,
+      thumb => $source_thumb,
+      dest  => $dest_thumb,
+    };
+  }
+  elsif(-d $item) {
+    opendir my $D, "$item";
+    while(my $file = readdir($D)) {
+      if(-f "$item/$file" && $file =~ /\.mkv|\.mp4|\.avi/i) {
+        (my $thumb = $file) =~ s/(.*)\.[^\.]+/$1/;
+        if(-f "$item/$thumb-thumb.jpg.up" && !-f "$item/$thumb-thumb.jpg") {
+          move("$item/$thumb-thumb.jpg.up", "$item/$thumb-thumb.jpg");
+        }
+        if(-f "$item/$thumb.tbn.up" && !-f "$item/$thumb.tbn") {
+          move("$item/$thumb.tbn.up", "$item/$thumb.tbn");
+        }
+        my $source_thumb = (-f "$item/$thumb.tbn") ? "$item/$thumb.tbn" : "$item/$thumb-thumb.jpg";
+        my $dest_thumb   = "$item/$thumb-thumb.jpg";
+        push @queue, {
+          file  => "$item/$file",
+          thumb => $source_thumb,
+          dest  => $dest_thumb,
+        };
+      }
+    }
+    closedir $D;
+  }
+}
+
+my $said = 0;
+
+foreach my $item (sort { $a->{file} cmp $b->{file} } @queue) {
+  DEBUG "file: $item->{file}";
+  $opt{file}  = $item->{file};
+  $opt{thumb} = $item->{thumb};
+  $opt{dest}  = $item->{dest};
+  if(-f $opt{thumb}) {
+    my $ut = UpThumb->new(%opt);
+    if(!$ut->is_upthumb) {
+      unless($said) {
+        my @printopt = map {
+          my $a = (defined $opt{$_}) ? $opt{$_} : '-';
+          $a =~ s/^0$/false/;
+          $a =~ s/^1$/true/;
+          $a =~ s|.*/||;
+          "$_: $a" 
+        } sort grep($_ !~ /thumb|file|dest|ffmpeg|convert|identify/, keys %opt);
+        say "upthumb";
+        do { say "  $_" } for split /\n/, columnize(\@printopt, {ljust => 1, arrange_vertical => 1, displaywidth => 140});
+        say '';
+        $said = 1;
+      }
+      INFO "file: $item->{file}";
+      if($opt{magic}) {
+        $ut->upscale_thumb();
+      }
+      if(defined $opt{frame}) {
+        $ut->make_thumb_at($opt{frame});
+      }
+      elsif(my $frame = $ut->frame_grep($opt{file})) {
+        if(defined $frame) {
+          if($ut->make_thumb_at($frame)) {
+            if($ut->highscore >= $opt{replaceat}) {
+              INFO "probably fine to replace";
+            }
+            elsif($opt{deepfry}) {
+              INFO "deep frying";
+              if(my $frame = $ut->frame_grep($opt{file}, 999999999)) {
+                if(defined $frame) {
+                  if($ut->make_thumb_at($frame)) {
+                    if($ut->highscore >= $opt{replaceat}) {
+                      INFO "probably fine to replace";
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      $ut->_cleanup();
+      print "\n";
+    }
+    else {
+      DEBUG "skipping $opt{file}, thumbnail already created by upthumb";
+      DEBUG "";
+    }
+  }
+  else {
+    DEBUG "skipping $opt{file}, no thumbnail found";
+    DEBUG "";
+  }
+}
+
+package UpThumb;
+use Log::Log4perl qw/:easy/;
+use Parallel::ForkManager;
+use File::Copy;
+use IPC::Open3;
+use IO::Select;
+use Symbol;
+use v5.10;
+
+sub new {
+  my $type      = shift;
+  my %opt       = @_;
+  my ($self)    = {};
+  bless($self, $type);
+  $self->{ppid} = $$;
+  $self->{opt}  = \%opt;
+  $self->{pm}   = Parallel::ForkManager->new($self->{opt}->{forks});
+  if($self->{opt}->{fps}) {
+    $self->{fps} = "fps=fps=$self->{opt}->{fps},";
+  }
+  if($self->{opt}->{full}) {
+    $self->{fps} = '';
+  }
+  $self->_cleanup;
+  return $self;
+}
+
+sub DESTROY { my $self = shift; $self->_cleanup; }
+
+sub file {
+  my $self = shift;
+  my $file = shift;
+  if(defined $file && -f $file) {
+    $self->{opt}->{file} = $file;
+    $self->_cleanup;
+  }
+  elsif(!defined $file) {
+    return $self->{opt}->{file};
+  }
+}
+
+sub thumb {
+  my $self  = shift;
+  my $thumb = shift;
+  if(defined $thumb && -f $thumb) {
+    $self->{opt}->{thumb} = $thumb;
+    $self->_update_frameres;
+    $self->_cleanup;
+  }
+  elsif(!defined $thumb) {
+    return $self->{opt}->{thumb};
+  }
+}
+
+sub upscale_thumb {
+  my $self = shift;
+  my $w2x  = '/usr/local/bin/waifu2x-converter-cpp';
+  my $md   = '/home2/garret/build/waifu2x-converter-cpp/models_rgb';
+  my $m    = 'noise_scale';
+  my $sr   = 8;
+  my $res  = '800x600';
+  my $out;
+  (my $current = $self->sys($self->{opt}->{convert}, $self->{opt}->{thumb}, '-format', '%w:%h', 'info:')) =~ s/:.*//;
+  if($current < 640) {
+    INFO "upscaling old thumb with waifu2x ($current<640)";
+    copy($self->{opt}->{thumb}, "$self->{opt}->{thumb}.orig") unless -f "$self->{opt}->{thumb}.orig";
+    if(-f "$self->{opt}->{thumb}.orig") {
+      $out = $self->sys($w2x, '--model_dir', $md, '-m', $m, '--scale_ratio', $sr, '-i', $self->{opt}->{thumb}, '-o', "$self->{opt}->{thumb}_magic.jpg");
+      $out = $self->sys($self->{opt}->{convert}, "$self->{opt}->{thumb}_magic.jpg", '-resize', $res, $self->{opt}->{thumb});
+      unlink("$self->{opt}->{thumb}_magic.jpg");
+    }
+  }
+}
+
+sub _cleanup {
+  my $self = shift;
+  return unless $self->{ppid} == $$;
+  return unless -d $self->{opt}->{tmpdir};
+  return unless $self->{opt}->{clean};
+  INFO "cleaning up";
+  $self->sys('/bin/rm', '-fr', $self->{opt}->{tmpdir});
+}
+
+sub _update_frameres {
+  my $self = shift;
+  INFO 'fetching frameres from existing thumbnail';
+  $self->{opt}->{frameres} = $self->sys($self->{opt}->{convert}, $self->{opt}->{thumb}, '-format', '%w:%h', 'info:');
+  DEBUG "frameres = $self->{opt}->{frameres}";
+}
+
+sub _extract_frames {
+  my $self    = shift;
+  my $file    = shift;
+  my $efc     = shift // $self->{opt}->{limit};
+  my @extra   = ($efc>0) ? ('-t', $efc) : ();
+  my $deint   = ($self->{opt}->{deint}) ? 'yadif,' : '';
+  my @hwaccel = ($self->{opt}->{hwaccel} ne '') ? ('-hwaccel', $self->{opt}->{hwaccel}) : ();
+  $self->sys('/bin/mkdir', '-p', $self->{opt}->{tmpdir});
+  $self->_update_frameres if !defined $self->{opt}->{frameres};
+  INFO "extracting frames - deint: '$self->{opt}->{deint}', fps: '$self->{fps}', limit: '@extra', scale: '$self->{opt}->{frameres}', hwaccel: '@hwaccel'";
+  my $out = $self->sys(
+    $self->{opt}->{ffmpeg},
+    @hwaccel,
+    '-i', $file,
+    @extra,
+    '-vf', $deint.$self->{fps}."scale=".$self->{opt}->{frameres},
+    qw/-sn -an -vsync vfr -qscale:v 2 -frame_pts true/,
+    "$self->{opt}->{tmpdir}/frame_%d.jpg",
+  );
+  my $cmdout     = $self->sys('/usr/bin/find', $self->{opt}->{tmpdir}, '-type', 'f', '-name', 'frame_*.jpg');
+  my $framecount = ($cmdout =~ /\n/) ? scalar(split /\n/, $self->sys('/usr/bin/find', $self->{opt}->{tmpdir}, '-type', 'f', '-name', 'frame_*.jpg')) : undef;
+  $self->{framecount} = $framecount;
+  DEBUG "framecount = $self->{framecount}";
+  return $framecount;
+}
+
+sub is_upthumb {
+  my $self = shift;
+  my $info = $self->sys($self->{opt}->{identify}, '-verbose', $self->{opt}->{dest});
+  if($info =~ /comment: upthumb/i) {
+    return 1;
+  }
+  elsif($self->{opt}->{keepfresh} && $info =~ /comment: freshthumb/i) {
+    return 1;
+  }
+  else {
+    return 0;
+  }
+}
+
+sub highest {
+  my $self = shift;
+  return (defined $self->{cache}->{highest}) ? $self->{cache}->{highest} : 0;
+}
+
+sub highscore {
+  my $self = shift;
+  return (defined $self->{cache}->{highmatch}) ? $self->{cache}->{highmatch} : 0;
+}
+
+sub frame_grep {
+  my $self  = shift;
+  my $file  = shift;
+  my $fcr   = shift // $self->{opt}->{limit};
+  my $thumb = shift;
+  my %index;
+  my $highest   = 0;
+  my $highmatch = 0;
+  my $frames    = 0;
+  if($frames = $self->_extract_frames($file, $fcr)) {
+    return 0 unless defined $frames;
+    INFO "comparing $frames frames - vmaf: '$self->{opt}->{vmaf}', psnr: '$self->{opt}->{psnr}', ssim: '$self->{opt}->{ssim}', ms-ssim: '$self->{opt}->{ms_ssim}'";
+    $self->{pm}->run_on_finish(sub {
+      TRACE "fork finished";
+      my ($pid, $exit_code, $ident, $exit_signal, $core_dump, $data_structure_reference) = @_;
+      if (defined($data_structure_reference)) {
+        foreach my $line (split /\n/, ${$data_structure_reference}) {
+          my ($k, $v) = split /=/, $line;
+          if($highmatch < $v) {
+            $highmatch = $v;
+            $highest   = $k;
+          }
+        }
+      }
+    });
+    CHECK_LOOP: foreach my $frk (@{distribute($self->{opt}->{forks}, [1..$frames])}) {
+      my $pid = $self->{pm}->start and next CHECK_LOOP;
+      my $res = "0=0\n";
+      foreach my $frame (@$frk) {
+        $frame--;
+        my $score   = 0;
+        my $vmaf    = 0;
+        my $psnr    = 0;
+        my $ssim    = 0;
+        my $ms_ssim = 0;
+        foreach my $line (split /\n/, $self->sys($self->{opt}->{ffmpeg}, '-v', 'error', '-i', "$self->{opt}->{tmpdir}/frame_$frame.jpg", '-i', $self->{opt}->{thumb}, qw/-lavfi libvmaf=psnr=1:ssim=1:ms_ssim=0:enable_transform=1:phone_model=1:n_threads=4 -f null -/)) {
+          if($line =~ /^VMAF.*= (.*)/ && $1 !~ /nan/) {
+            $vmaf = $1 if $self->{opt}->{vmaf};
+          }
+          elsif($line =~ /^PSNR.*= (.*)/ && $1 !~ /nan/) {
+            $psnr = $1 if $self->{opt}->{psnr};
+          }
+          elsif($line =~ /^SSIM.*= (.*)/ && $1 !~ /nan/) {
+            $ssim = $1 * 100 if $self->{opt}->{ssim};
+          }
+          elsif($line =~ /^MS-SSIM.*= (.*)/ && $1 !~ /nan/) {
+            $ms_ssim = $1 * 100 if $self->{opt}->{ms_ssim};
+          }
+        }
+        $score = $psnr + $vmaf + $ssim + $ms_ssim;
+        TRACE "FRAME $frame VMAF $vmaf PSNR $psnr SSIM $ssim MS-SSIM $ms_ssim SCORE $score";
+        $res .= "$frame=$score\n";
+      }
+      $self->{pm}->finish(0, \$res);
+    }
+    $self->{pm}->wait_all_children;
+    INFO "best frame: $highest with score: $highmatch";
+    $self->{cache}->{highest}   = $highest;
+    $self->{cache}->{highmatch} = $highmatch;
+    return $highest;
+  }
+  else {
+    WARN 'unable to extract frames';
+    return 0;
+  }
+}
+
+sub distribute {
+  my ($n, $array) = @_;
+  my @parts;
+  my $i = 0;
+  DEBUG "distributing " . scalar(@$array) . " items across $n forks";
+  foreach my $elem (@$array) {
+    push @{ $parts[$i++ % $n] }, $elem;
+  };
+  return \@parts;
+};
+
+sub make_thumb_at {
+  my $self    = shift;
+  my $frame   = shift;
+  my $file    = $self->{opt}->{file};
+  my $deint   = ($self->{opt}->{deint}) ? 'yadif,' : '';
+  my @hwaccel = ($self->{opt}->{hwaccel} ne '') ? ('-hwaccel', $self->{opt}->{hwaccel}) : ();
+  DEBUG "moving old thumbnail '$self->{opt}->{thumb}' to '$self->{opt}->{thumb}.up'";
+  system('/bin/mv', $self->{opt}->{thumb}, $self->{opt}->{thumb}.'.up');
+  unlink $self->{opt}->{dest}.'-old.jpg'
+    if -f $self->{opt}->{dest}.'-old.jpg';
+  system('/bin/mv', $self->{opt}->{dest},  $self->{opt}->{dest}.'-old.jpg')
+    if -f $self->{opt}->{dest};
+  INFO "creating thumb for '$file' at frame $frame";
+  my $out = $self->sys(
+    $self->{opt}->{ffmpeg},
+    @hwaccel,
+    '-i', $file, 
+    '-filter_complex', "$deint$self->{fps}select='eq(n,$frame)',scale=$self->{opt}->{thumbres}:lanczos+full_chroma_inp", 
+    qw/-vframes 1 -an -sn -qmin 1 -qmax 1 -huffman optimal -qscale:v 1/, 
+    $self->{opt}->{dest},
+  );
+  if(-f $self->{opt}->{dest}) {
+    $self->sys(
+      $self->{opt}->{convert},
+      $self->{opt}->{dest},
+      qw/-set comment upthumb/,
+      $self->{opt}->{dest},
+    );
+    return 1;
+  }
+  else {
+    return 0;
+  }
+}
+
+sub sys {
+  my $self = shift;
+  my $app  = shift;
+  my @args = @_;
+  my $opts = {
+    stdout  => 1,
+    stderr  => 1,
+    write   => undef,
+  };
+  if(ref($args[$#args]) eq 'HASH') {
+    my $newopts = pop @args;
+    foreach my $item (keys %$newopts) {
+      $opts->{$item} = $newopts->{$item};
+    }
+  }
+  my ($pid, $in, $out, $err, $sel, $buf);
+  $err = gensym();
+  TRACE "## $app @args";
+  $pid = open3($in, $out, $err, $app, @args) or die "failed to open $app: @args";
+  $sel = new IO::Select;
+  $sel->add($out,$err);
+  if($pid && defined $opts->{write}) {
+    TRACE ">> $opts->{write}";
+    print $in $opts->{write};
+  }
+  close $in;
+  SYSLOOP: while(my @ready = $sel->can_read) {
+    foreach my $fh (@ready) {
+      my $line = <$fh>;
+      if(not defined $line) {
+        $sel->remove($fh);
+        next;
+      }
+      if($fh == $out) {
+        TRACE "<< $line";
+        $buf .= $line if $opts->{stdout};
+      }
+      elsif($fh == $err) {
+        TRACE "!! $line";
+        $buf .= $line if $opts->{stderr};
+      }
+      else {
+        TRACE "// Shouldn't be here";
+        return undef;
+      }
+    }
+  }
+  waitpid($pid, 0);
+  TRACE '' if(defined $buf && $buf !~ /\n$/ && $self->{opt}->{verbose});
+  return $buf;
+}
+
+sub slurp { local $/ = <> if local @ARGV = @_ }
+
